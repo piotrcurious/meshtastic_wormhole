@@ -4,7 +4,7 @@ This directory contains the production-ready C++ firmware port of the **Meshtast
 
 ## Project Structure
 
-- `src/main.cpp`: Entrypoint, initializes hardware interfaces, sets up routing, and schedules updates.
+- `src/main.cpp`: Entrypoint, initializes hardware interfaces, sets up routing, schedules updates, and manages dynamic power-saving states.
 - `src/packet.h`: Custom 'WHOL' binary packet parser matching exact spec byte offsets, support for hops counts and lists.
 - `src/deduplicator.h`: TTL-based map packet cache for loop deduplication.
 - `src/lora_interface.h`: Abstract LoRa antenna base definition.
@@ -18,6 +18,10 @@ This directory contains the production-ready C++ firmware port of the **Meshtast
 1. **Dual WiFi Backends**: Attempts to initialize high-speed native 802.11s ESP-MESH hardware routing. If hardware or environment fails, gracefully falls back to softAP mode with IP Multicast UDP packets on `239.10.10.10:4403`.
 2. **Standard SLIP Framing**: Safely frames incoming and outgoing packets over Serial to LoRa transceivers (e.g. SX1262 modules).
 3. **Loop & Duplicate Prevention**: Unpacks the wormhole header, registers visited node hops list, and discards loops and duplicate packets within a 120s TTL window.
+4. **Low Power Management & Power Saving**:
+   - Dynamic Frequency Scaling (DFS): Automatically throttles CPU core frequency down to 10MHz when idle, returning to 160MHz instantly on packet arrival.
+   - WiFi Modem Sleep: Configured `esp_wifi_set_ps(WIFI_PS_MIN_MODEM)` to drastically reduce idle power consumption.
+   - Configurable at compile time via `ENABLE_POWER_SAVING` define.
 
 ## Compile & Deploy
 
