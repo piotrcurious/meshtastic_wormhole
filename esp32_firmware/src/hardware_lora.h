@@ -59,16 +59,25 @@ public:
             } else if (byte == SLIP_ESC) {
                 in_escape = true;
             } else if (in_escape) {
-                if (byte == SLIP_ESC_END) {
-                    rx_buffer.push_back(SLIP_END);
-                } else if (byte == SLIP_ESC_ESC) {
-                    rx_buffer.push_back(SLIP_ESC);
+                // Safeguard: Cap buffer size to prevent out-of-memory under physical serial noise
+                if (rx_buffer.size() < 1024) {
+                    if (byte == SLIP_ESC_END) {
+                        rx_buffer.push_back(SLIP_END);
+                    } else if (byte == SLIP_ESC_ESC) {
+                        rx_buffer.push_back(SLIP_ESC);
+                    } else {
+                        rx_buffer.push_back(byte);
+                    }
                 } else {
-                    rx_buffer.push_back(byte);
+                    rx_buffer.clear(); // Overflow, discard corrupted frame
                 }
                 in_escape = false;
             } else {
-                rx_buffer.push_back(byte);
+                if (rx_buffer.size() < 1024) {
+                    rx_buffer.push_back(byte);
+                } else {
+                    rx_buffer.clear(); // Overflow, discard corrupted frame
+                }
             }
         }
     }
