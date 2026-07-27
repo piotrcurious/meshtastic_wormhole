@@ -5,7 +5,7 @@
 #include "packet.h"
 #include "deduplicator.h"
 #include "hardware_lora.h"
-#include "painless_mesh_impl.h"
+#include "multicast_mesh_impl.h"
 #include "esp_mesh_wifi.h" // Added native 802.11s hardware mesh config
 
 // Configuration parameters
@@ -16,24 +16,17 @@ uint32_t next_packet_sequence = 1;
 
 // Power Saving Configuration
 #define ENABLE_POWER_SAVING true
-unsigned long last_activity_time = 0;
-const unsigned long IDLE_TIMEOUT_MS = 10000; // Go to ultra-low frequency after 10s idle
 
 // Interface instances
 HardwareLora lora_driver(Serial1, 115200); // ESP32-C3 standard hardware serial
-PainlessMeshImpl wifi_mesh("239.10.10.10", 4403);
+MulticastMeshImpl wifi_mesh("239.10.10.10", 4403);
 EspMeshWifi native_mesh("MWBMES", 1);      // 802.11s hardware mesh fallback
 Deduplicator dedup(120);
 
 // Set default routing backend
 bool use_native_mesh = false;
 
-// Register activity to postpone sleep/power down
-void register_activity() {
-    last_activity_time = millis();
-}
-
-// Configure Espressif Power Management API for dynamic frequency scaling
+// Configure Espressif Power Management API for dynamic frequency scaling (DFS)
 void setup_power_management() {
 #if ENABLE_POWER_SAVING
     // Configure WiFi Modem Sleep to save power during idle periods
@@ -42,8 +35,8 @@ void setup_power_management() {
     // Dynamic frequency scaling (DFS) configuration
     esp_pm_config_esp32c3_t pm_config;
     pm_config.max_freq_mhz = 160; // Max frequency for processing packets
-    pm_config.min_freq_mhz = 10;  // Minimum frequency for ultra low power idle
-    pm_config.light_sleep_enable = true; // Allow automatic light sleep
+    pm_config.min_freq_mhz = 80;  // Minimum 80MHz to keep Wi-Fi stack and peripherals active safely
+    pm_config.light_sleep_enable = true; // Allow automatic background light sleep
 
     esp_err_t err = esp_pm_configure(&pm_config);
     if (err == ESP_OK) {
@@ -56,7 +49,6 @@ void setup_power_management() {
 
 // Receive from local LoRa antenna -> Forward to WiFi Mesh
 void on_lora_rx(const uint8_t* payload, size_t length) {
-    register_activity();
     Serial.printf("LoRa RX: received payload size %d\n", length);
 
     uint32_t pkt_id = next_packet_sequence++;
@@ -92,7 +84,6 @@ void on_lora_rx(const uint8_t* payload, size_t length) {
 
 // Receive from WiFi Mesh -> Decode, Deduplicate & Retransmit on local LoRa
 void on_mesh_rx(const uint8_t* payload, size_t length, uint64_t from_node) {
-    register_activity();
     WormholePacket pkt;
     if (!WormholePacket::unpack(payload, length, pkt)) {
         Serial.println("WiFi RX Error: failed to unpack wormhole packet");
@@ -151,18 +142,17 @@ void setup() {
     wifi_mesh.register_rx_callback(on_mesh_rx);
     native_mesh.register_rx_callback(on_mesh_rx);
 
-    // Try starting 802.11s native hardware mesh first
+    // FIX: Initialize the Wi-Fi stack and configure network mode FIRST before configuring/starting MESH APIs
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(WIFI_SSID, WIFI_PASS);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    // Try starting 802.11s native hardware mesh
     if (native_mesh.start()) {
         use_native_mesh = true;
         Serial.println("Native 802.11s ESP-MESH initialized and active.");
     } else {
         Serial.println("Native ESP-MESH initialization failed. Falling back to softAP IP Multicast mode...");
-
-        // Setup AP-Mesh / Station WiFi connections
-        Serial.printf("Connecting to WiFi SSID: %s\n", WIFI_SSID);
-        WiFi.mode(WIFI_AP_STA);
-        WiFi.softAP(WIFI_SSID, WIFI_PASS);
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
 
         int retries = 0;
         while (WiFi.status() != WL_CONNECTED && retries < 15) {
@@ -187,7 +177,6 @@ void setup() {
     // Start lora interfaces
     lora_driver.start();
 
-    register_activity();
     Serial.println("ESP32-C3 Wormhole Bridge Running.");
 }
 
@@ -198,20 +187,5 @@ void loop() {
     } else {
         wifi_mesh.update();
     }
-
-    // Handle optional power saving steps when idle
-#if ENABLE_POWER_SAVING
-    unsigned long now = millis();
-    if (now - last_activity_time > IDLE_TIMEOUT_MS) {
-        // Drop CPU frequency temporarily to save power
-        setCpuFrequencyMhz(10);
-        delay(50); // Yield to lower core operations and light sleep triggers
-    } else {
-        // Return to standard 160MHz for high-speed operation
-        setCpuFrequencyMhz(160);
-        delay(1);
-    }
-#else
-    delay(1); // yield to background task processor
-#endif
+    delay(1); // yield to background task processor and allow background light sleep to enter safely
 }

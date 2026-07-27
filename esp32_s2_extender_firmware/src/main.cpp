@@ -4,7 +4,7 @@
 #include <esp_pm.h>
 #include "packet.h"
 #include "deduplicator.h"
-#include "painless_mesh_impl.h"
+#include "multicast_mesh_impl.h"
 #include "esp_mesh_wifi.h"
 
 // Configuration parameters
@@ -14,20 +14,14 @@ uint64_t esp_node_id = 0;
 
 // Power Saving Configuration for ESP32-S2
 #define ENABLE_POWER_SAVING true
-unsigned long last_activity_time = 0;
-const unsigned long IDLE_TIMEOUT_MS = 15000; // Drop power to ultra-low after 15s idle
 
 // Mesh instances
-PainlessMeshImpl wifi_mesh("239.10.10.10", 4403);
+MulticastMeshImpl wifi_mesh("239.10.10.10", 4403);
 EspMeshWifi native_mesh("MWBMES", 1);
 Deduplicator dedup(120);
 
 // Set default routing backend
 bool use_native_mesh = false;
-
-void register_activity() {
-    last_activity_time = millis();
-}
 
 // Configure ESP32-S2 specific Power Management (DFS and low-power Modem sleep)
 void setup_power_management() {
@@ -38,7 +32,7 @@ void setup_power_management() {
     // ESP32-S2 Dynamic Frequency Scaling configuration
     esp_pm_config_esp32s2_t pm_config;
     pm_config.max_freq_mhz = 240; // Max frequency for processing packets on S2
-    pm_config.min_freq_mhz = 10;  // Minimum frequency for ultra low power idle
+    pm_config.min_freq_mhz = 80;  // Minimum 80MHz to keep Wi-Fi stack and peripherals active safely
     pm_config.light_sleep_enable = true; // Auto light sleep triggers
 
     esp_err_t err = esp_pm_configure(&pm_config);
@@ -52,7 +46,6 @@ void setup_power_management() {
 
 // Receive from WiFi Mesh -> Check, Register Hop/Visit, and forward to repeat/extend coverage
 void on_mesh_rx(const uint8_t* payload, size_t length, uint64_t from_node) {
-    register_activity();
     WormholePacket pkt;
     if (!WormholePacket::unpack(payload, length, pkt)) {
         Serial.println("Extender WiFi RX Error: failed to unpack wormhole packet");
@@ -111,18 +104,17 @@ void setup() {
     wifi_mesh.register_rx_callback(on_mesh_rx);
     native_mesh.register_rx_callback(on_mesh_rx);
 
+    // FIX: Initialize the Wi-Fi stack and configure network mode FIRST before configuring/starting MESH APIs
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(WIFI_SSID, WIFI_PASS);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
     // Try starting 802.11s native hardware mesh first
     if (native_mesh.start()) {
         use_native_mesh = true;
         Serial.println("Native 802.11s ESP-MESH initialized and active on Extender.");
     } else {
         Serial.println("Native ESP-MESH failed on Extender. Falling back to SoftAP IP Multicast mode...");
-
-        // Setup AP-Mesh / Station WiFi connections
-        Serial.printf("Connecting to WiFi SSID: %s\n", WIFI_SSID);
-        WiFi.mode(WIFI_AP_STA);
-        WiFi.softAP(WIFI_SSID, WIFI_PASS);
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
 
         int retries = 0;
         while (WiFi.status() != WL_CONNECTED && retries < 15) {
@@ -144,7 +136,6 @@ void setup() {
     // Configure power saving & dynamic power scaling
     setup_power_management();
 
-    register_activity();
     Serial.println("ESP32-S2 Extender Running.");
 }
 
@@ -154,20 +145,5 @@ void loop() {
     } else {
         wifi_mesh.update();
     }
-
-    // Handle optional power saving steps when idle on ESP32-S2
-#if ENABLE_POWER_SAVING
-    unsigned long now = millis();
-    if (now - last_activity_time > IDLE_TIMEOUT_MS) {
-        // Drop CPU frequency temporarily to save power on ESP32-S2
-        setCpuFrequencyMhz(10);
-        delay(50); // Yield to lower core operations and light sleep triggers
-    } else {
-        // Return to standard 240MHz for high-speed operation on ESP32-S2
-        setCpuFrequencyMhz(240);
-        delay(1);
-    }
-#else
-    delay(1); // yield to background task processor
-#endif
+    delay(1); // yield to background task processor and allow background light sleep to enter safely
 }

@@ -1,19 +1,20 @@
-#ifndef PAINLESS_MESH_IMPL_H
-#define PAINLESS_MESH_IMPL_H
+#ifndef MULTICAST_MESH_IMPL_H
+#define MULTICAST_MESH_IMPL_H
 
 #include "wifi_mesh_interface.h"
+#include "packet.h"
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
 // Fully functional WiFi Mesh transport using standard UDP multicast on ESP32-S2
-class PainlessMeshImpl : public WifiMeshInterface {
+class MulticastMeshImpl : public WifiMeshInterface {
 private:
     WiFiUDP udp;
     IPAddress multicast_ip;
     uint16_t port;
 
 public:
-    PainlessMeshImpl(const char* mcast_group = "239.10.10.10", uint16_t port_num = 4403)
+    MulticastMeshImpl(const char* mcast_group = "239.10.10.10", uint16_t port_num = 4403)
         : multicast_ip(), port(port_num) {
         multicast_ip.fromString(mcast_group);
     }
@@ -40,12 +41,19 @@ public:
             std::vector<uint8_t> buffer(packetSize);
             int len = udp.read(buffer.data(), packetSize);
             if (len > 0) {
-                // Mock from_node using IP sender address for simplification or node resolution
-                uint64_t from_node = (uint32_t)udp.remoteIP();
+                // Decode the packet header dynamically to extract actual Source ID
+                uint64_t from_node = 0;
+                WormholePacket temp_pkt;
+                if (WormholePacket::unpack(buffer.data(), len, temp_pkt)) {
+                    from_node = temp_pkt.source_id;
+                } else {
+                    // Fallback to sender's IP address on malformed packets
+                    from_node = (uint32_t)udp.remoteIP();
+                }
                 trigger_rx(buffer.data(), len, from_node);
             }
         }
     }
 };
 
-#endif // PAINLESS_MESH_IMPL_H
+#endif // MULTICAST_MESH_IMPL_H

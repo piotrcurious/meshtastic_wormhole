@@ -4,9 +4,9 @@
 #include "wifi_mesh_interface.h"
 #include <esp_mesh.h>
 #include <WiFi.h>
+#include <algorithm>
 
 // Full implementation of the native ESP-MESH (802.11s) hardware API
-// to route packages directly without typical router/AP dependencies
 class EspMeshWifi : public WifiMeshInterface {
 private:
     mesh_cfg_t config;
@@ -18,7 +18,9 @@ public:
         memset(&config, 0, sizeof(mesh_cfg_t));
         config.channel = channel;
         // Set mesh ID (6 bytes)
-        memcpy(config.mesh_id.addr, mesh_id, min(strlen(mesh_id), (size_t)6));
+        size_t id_len = strlen(mesh_id);
+        size_t copy_len = (id_len < 6) ? id_len : 6;
+        memcpy(config.mesh_id.addr, mesh_id, copy_len);
     }
 
     bool start() override {
@@ -53,7 +55,8 @@ public:
         // Correct broadcast destination handling in esp_mesh_send
         mesh_addr_t bcast_mac;
         memset(bcast_mac.addr, 0xFF, 6);
-        esp_err_t err = esp_mesh_send(&bcast_mac, &mesh_packet, MESH_DATA_BROADCAST, NULL, 0);
+        // Using standard flag 0 (equivalent to MESH_DATA_P2P) for broadcast routing
+        esp_err_t err = esp_mesh_send(&bcast_mac, &mesh_packet, 0, NULL, 0);
         return err == ESP_OK;
     }
 
