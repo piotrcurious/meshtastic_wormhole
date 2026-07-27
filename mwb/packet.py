@@ -7,7 +7,9 @@ class WormholePacket:
     """
     MWB Wormhole Packet implementation.
 
-    Binary structure:
+    Refined to strictly match the design specification:
+
+    OFFSET SIZE DESCRIPTION
     0       4    MAGIC ('WHOL')
     4       1    VERSION (currently 1)
     5       1    FLAGS (bit 0: loop prevention type, etc. Currently 0)
@@ -16,9 +18,12 @@ class WormholePacket:
     16      4    PACKET ID (32-bit unique sequence/id)
     20      4    TIMESTAMP (32-bit epoch)
     24      2    PAYLOAD LENGTH (16-bit payload length)
+
+    -- Dynamically appended field if Version 2 loop prevention / hop list is enabled:
     26      2    HOPS COUNT (16-bit count of visited node IDs)
     28      8*H  HOPS LIST (list of 64-bit source IDs representing visited/hop nodes)
-    X       N    MESHTASTIC FRAME (payload)
+
+    X       N    MESHTASTIC FRAME (payload at HEADER SIZE offset)
     """
 
     def __init__(self, source_id: int, packet_id: int, payload: bytes, timestamp: int = None, version: int = 1, flags: int = 0, hops: list = None):
@@ -32,13 +37,19 @@ class WormholePacket:
 
     def pack(self) -> bytes:
         hops_count = len(self.hops)
-        # Header size without hops list is 28 bytes
-        header_size = 28 + (8 * hops_count)
+        # Standard base header size (without hop list metadata) is 26 bytes.
+        # If hops list is used, we append a 2-byte hops count and 8*H bytes of hop IDs.
+        if hops_count > 0:
+            header_size = 26 + 2 + (8 * hops_count)
+        else:
+            header_size = 26
+
         payload_length = len(self.payload)
 
-        # Base format: 4s (MAGIC), B (version), B (flags), H (header_size), Q (source_id), I (packet_id), I (timestamp), H (payload_length), H (hops_count)
+        # Base Format: 4s (MAGIC), B (version), B (flags), H (header_size), Q (source_id), I (packet_id), I (timestamp), H (payload_length)
+        # Note: Using Q for unsigned 64-bit source_id and I for unsigned 32-bit packet_id to avoid overflow/sign crashes.
         base_header = struct.pack(
-            "<4sBBHqiIHH",
+            "<4sBBHQIIH",
             MAGIC_BYTES,
             self.version,
             self.flags,
@@ -46,25 +57,26 @@ class WormholePacket:
             self.source_id,
             self.packet_id,
             self.timestamp,
-            payload_length,
-            hops_count
+            payload_length
         )
 
-        # Pack the hops list
+        # Pack the hops list metadata if hops_count > 0
         hops_data = b""
-        for hop_id in self.hops:
-            hops_data += struct.pack("<q", hop_id)
+        if hops_count > 0:
+            hops_data += struct.pack("<H", hops_count)
+            for hop_id in self.hops:
+                hops_data += struct.pack("<Q", hop_id)
 
         return base_header + hops_data + self.payload
 
     @classmethod
     def unpack(cls, data: bytes) -> 'WormholePacket':
-        if len(data) < 28:
+        if len(data) < 26:
             raise ValueError("Packet too short to contain minimal wormhole header.")
 
-        magic, version, flags, header_size, source_id, packet_id, timestamp, payload_length, hops_count = struct.unpack(
-            "<4sBBHqiIHH",
-            data[:28]
+        magic, version, flags, header_size, source_id, packet_id, timestamp, payload_length = struct.unpack(
+            "<4sBBHQIIH",
+            data[:26]
         )
 
         if magic != MAGIC_BYTES:
@@ -73,13 +85,19 @@ class WormholePacket:
         if len(data) < header_size + payload_length:
             raise ValueError(f"Packet data size {len(data)} is less than header_size ({header_size}) + payload_length ({payload_length})")
 
-        # Parse hops
+        # Parse hops if header_size is greater than 26
         hops = []
-        hop_start = 28
-        for _ in range(hops_count):
-            hop_id, = struct.unpack("<q", data[hop_start:hop_start+8])
-            hops.append(hop_id)
-            hop_start += 8
+        if header_size > 26:
+            if len(data) < 28:
+                raise ValueError("Packet has header_size > 26 but data is too short to contain hops count.")
+            hops_count, = struct.unpack("<H", data[26:28])
+            hop_start = 28
+            for _ in range(hops_count):
+                if len(data) < hop_start + 8:
+                    raise ValueError("Packet truncated before reading all hops from hops list.")
+                hop_id, = struct.unpack("<Q", data[hop_start:hop_start+8])
+                hops.append(hop_id)
+                hop_start += 8
 
         payload = data[header_size:header_size + payload_length]
 
