@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_pm.h>
+#include <map>
 #include "packet.h"
 #include "deduplicator.h"
 #include "multicast_mesh_impl.h"
@@ -22,6 +23,18 @@ Deduplicator dedup(120);
 
 // Set default routing backend
 bool use_native_mesh = false;
+
+// Smart Routing Directory: Maps Meshtastic Node ID (uint32_t) -> Wormhole Node ID (uint64_t)
+std::map<uint32_t, uint64_t> routing_table;
+
+// Parse outer Meshtastic packet header (destination and source)
+bool parse_meshtastic_header(const uint8_t* payload, size_t length, uint32_t& to_node, uint32_t& from_node) {
+    if (length < 12) return false;
+    // Unpack first 12 bytes: to_node (4 bytes), from_node (4 bytes), packet_id (4 bytes)
+    to_node = payload[0] | (payload[1] << 8) | (payload[2] << 16) | (payload[3] << 24);
+    from_node = payload[4] | (payload[5] << 8) | (payload[6] << 16) | (payload[7] << 24);
+    return true;
+}
 
 // Configure ESP32-S2 specific Power Management (DFS and low-power Modem sleep)
 void setup_power_management() {
@@ -54,22 +67,39 @@ void on_mesh_rx(const uint8_t* payload, size_t length, uint64_t from_node) {
 
     Serial.printf("Extender WiFi RX: received packet %d from source %llx\n", pkt.packet_id, pkt.source_id);
 
+    // Smart Routing Discovery
+    uint32_t to_node = 0, from_node_mesh = 0;
+    if (parse_meshtastic_header(pkt.payload.data(), pkt.payload.size(), to_node, from_node_mesh)) {
+        routing_table[from_node_mesh] = pkt.source_id;
+        Serial.printf("Extender Smart Routing: Mapped Meshtastic Node %x to Wormhole %llx\n", from_node_mesh, pkt.source_id);
+    }
+
     // 1. Loop prevention check
     if (pkt.has_visited(esp_node_id)) {
         Serial.printf("Extender Loop Prevention: Dropped packet %d - already visited this node\n", pkt.packet_id);
         return;
     }
 
-    // 2. Deduplication check
+    // 2. Targeted Routing check
+    bool is_targeted = (pkt.flags & 0x02) != 0;
+    if (is_targeted && pkt.hops.size() >= 2) {
+        uint64_t target_id = pkt.hops[1];
+        if (target_id != esp_node_id && pkt.source_id != esp_node_id) {
+            Serial.printf("Extender Smart Routing: Bypassing packet %d - targeted for Wormhole %llx\n", pkt.packet_id, target_id);
+            return;
+        }
+    }
+
+    // 3. Deduplication check
     if (dedup.is_duplicate(pkt.source_id, pkt.packet_id)) {
         Serial.printf("Extender Deduplication: Dropped packet %d - already processed\n", pkt.packet_id);
         return;
     }
 
-    // 3. Register hop visit
+    // 4. Register hop visit
     pkt.add_hop(esp_node_id);
 
-    // 4. Forward updated packet back to WiFi mesh to repeat/extend range
+    // 5. Forward updated packet back to WiFi mesh to repeat/extend range
     std::vector<uint8_t> updated_packed = pkt.pack();
 
     bool sent = false;
