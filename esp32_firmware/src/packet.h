@@ -1,8 +1,13 @@
 #ifndef PACKET_H
 #define PACKET_H
 
+#ifdef ARDUINO
 #include <Arduino.h>
+#endif
+
 #include <vector>
+#include <cstdint>
+#include <cstring>
 
 const uint8_t MAGIC_BYTES[4] = {'W', 'H', 'O', 'L'};
 
