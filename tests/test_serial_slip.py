@@ -61,6 +61,16 @@ def test_slip_boundary_splits():
     # 0xDB + 0xDC should decode to 0xC0
     assert frames2[0] == bytes([0x41, 0xC0, 0x42])
 
+def test_slip_malformed_violation():
+    """Verify that SLIP protocol violations are handled gracefully."""
+    # 0xC0 [data] 0xDB [invalid byte e.g. 0x00] 0xC0
+    malformed = bytes([0xC0, 0x41, 0xDB, 0x00, 0x42, 0xC0])
+    interface = SerialLoRaInterface(port="DUMMY")
+    frames = interface.decode_slip_step(malformed)
+    assert len(frames) == 1
+    # Should fall back and preserve the invalid byte or drop safely (here we preserve)
+    assert frames[0] == bytes([0x41, 0x00, 0x42])
+
 @pytest.mark.asyncio
 async def test_serial_interface_with_dummy():
     dummy = DummySerial()
