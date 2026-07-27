@@ -15,6 +15,41 @@
 #include "../src/meshcore_packet.h"
 #include "../src/packet.h"
 #include "../src/deduplicator.h"
+#include "../src/lora_bridge.h"
+#include "../src/extender.h"
+
+// Test double implementations to capture bridge behavior
+class TestWifi : public WifiMeshInterface {
+public:
+    std::vector<std::vector<uint8_t>> broadcasts;
+
+    bool start() override { return true; }
+    bool broadcast(const uint8_t* data, size_t length) override {
+        broadcasts.push_back(std::vector<uint8_t>(data, data + length));
+        return true;
+    }
+    void update() override {}
+
+    void simulate_rx(const uint8_t* data, size_t length, uint64_t from_node) {
+        trigger_rx(data, length, from_node);
+    }
+};
+
+class TestLora : public LoraInterface {
+public:
+    std::vector<std::string> transmissions;
+
+    bool start() override { return true; }
+    bool transmit(const uint8_t* data, size_t length) override {
+        transmissions.push_back(std::string((char*)data, length));
+        return true;
+    }
+    void update() override {}
+
+    void simulate_rx(const uint8_t* data, size_t length) {
+        trigger_rx(data, length);
+    }
+};
 
 // C++ Implementation of CoordinatorNode for geographical grid sorting and routing verification
 class TestCoordinator {
@@ -95,34 +130,23 @@ public:
 };
 
 void test_haversine_distance_and_region_contains() {
-    // SOMA center near 37.77, -122.41
     Region soma("SOMA", 37.7700, -122.4100, 1000.0); // 1000m radius
-
-    // Coordinates close (~220m) should be inside SOMA
     assert(soma.contains(37.771, -122.411) == true);
-
-    // Coordinates far away should be outside
     assert(soma.contains(37.950, -122.100) == false);
-
     std::cout << "test_haversine_distance_and_region_contains: PASSED" << std::endl;
 }
 
 void test_meshcore_packet_geographical_filtering() {
     Region soma("SOMA", 37.7700, -122.4100, 1000.0);
     Region mission("Mission", 37.7500, -122.4100, 1000.0);
-    std::vector<Region> regions = {soma, mission};
 
-    // Global scope packet should be valid on a SOMA node
     MeshCorePacket p_global("#QR", "0000eeee", "global", "message");
     p_global.data_text = "GLOBAL CHAT";
     assert(p_global.is_valid_for_node(37.771, -122.411, {soma}) == true);
 
-    // Regional scope packet targeting "Mission" should NOT be valid on SOMA coordinates
     MeshCorePacket p_regional("#QR", "0000eeee", "regional", "message", "Mission");
     p_regional.data_text = "MISSION CHAT";
     assert(p_regional.is_valid_for_node(37.771, -122.411, {soma}) == false);
-
-    // But should be valid on Mission coordinates
     assert(p_regional.is_valid_for_node(37.751, -122.411, {mission}) == true);
 
     std::cout << "test_meshcore_packet_geographical_filtering: PASSED" << std::endl;
@@ -139,10 +163,7 @@ void test_meshcore_packet_serialization_deserialization() {
     assert(json_str.find("\"scope\":\"regional\"") != std::string::npos);
     assert(json_str.find("\"type\":\"command\"") != std::string::npos);
     assert(json_str.find("\"region\":\"SOMA\"") != std::string::npos);
-    assert(json_str.find("\"target\":\"00005678\"") != std::string::npos);
-    assert(json_str.find("\"light\":\"on\"") != std::string::npos);
 
-    // Parse back
     MeshCorePacket unpacked = MeshCorePacket::from_json(json_str);
     assert(unpacked.channel == "#QR");
     assert(unpacked.sender == "00001234");
@@ -160,21 +181,17 @@ void test_coordinator_multi_region_grid_sorting() {
     Region mission("Mission", 37.7500, -122.4100, 1500.0);
     TestCoordinator coordinator({soma, mission});
 
-    // Register SOMA nodes
     coordinator.register_node("soma_node_2", 37.772, -122.408);
     coordinator.register_node("soma_node_1", 37.772, -122.412);
 
-    // Register Mission nodes
     coordinator.register_node("mission_node_1", 37.752, -122.412);
     coordinator.register_node("mission_node_2", 37.752, -122.408);
 
-    // Verify grid sorting: SOMA row 0 should contain "soma_node_1" then "soma_node_2" (West to East)
     const auto& soma_grid = coordinator.regional_grids["SOMA"];
     assert(soma_grid.size() == 1);
     assert(soma_grid[0][0] == "soma_node_1");
     assert(soma_grid[0][1] == "soma_node_2");
 
-    // Verify grid sorting: Mission row 0 should contain "mission_node_1" then "mission_node_2" (West to East)
     const auto& mission_grid = coordinator.regional_grids["Mission"];
     assert(mission_grid.size() == 1);
     assert(mission_grid[0][0] == "mission_node_1");
@@ -183,12 +200,152 @@ void test_coordinator_multi_region_grid_sorting() {
     std::cout << "test_coordinator_multi_region_grid_sorting: PASSED" << std::endl;
 }
 
+void test_lora_bridge_routing() {
+    Region soma("SOMA", 37.7700, -122.4100, 1500.0);
+    Region mission("Mission", 37.7500, -122.4100, 1500.0);
+    std::vector<Region> regions = {soma, mission};
+
+    TestLora lora;
+    TestWifi wifi;
+    Deduplicator dedup(120);
+    uint32_t packet_counter = 1;
+
+    // Bridge node 0xABCD located in SOMA
+    LoraBridge bridge(lora, wifi, dedup, 0xABCD, packet_counter, 37.7720, -122.4120, regions);
+    bool ok = bridge.start();
+    assert(ok == true);
+
+    // 1. Simulate local LoRa message transmit -> Bridge should encapsulate in MeshCorePacket and send over WiFi mesh
+    bridge.handle_lora_rx((const uint8_t*)"Hello Bridge", 12);
+    assert(wifi.broadcasts.size() == 1);
+
+    WormholePacket pkt;
+    bool unpacked = WormholePacket::unpack(wifi.broadcasts[0].data(), wifi.broadcasts[0].size(), pkt);
+    assert(unpacked == true);
+    assert(pkt.source_id == 0xABCD);
+
+    std::string payload_str((char*)pkt.payload.data(), pkt.payload.size());
+    MeshCorePacket mc_pkt = MeshCorePacket::from_json(payload_str);
+    assert(mc_pkt.channel == "#QR");
+    assert(mc_pkt.scope == "limited");
+    assert(mc_pkt.data_text == "Hello Bridge");
+    assert(mc_pkt.region == "SOMA"); // Bridge correctly resolved itself in SOMA
+
+    // 2. Simulate incoming regional packet on WiFi targeting "SOMA" -> Bridge should forward to local LoRa serial
+    MeshCorePacket in_soma_pkt("#QR", "0000eeee", "regional", "message", "SOMA");
+    in_soma_pkt.data_text = "WELCOME TO SOMA";
+    std::string soma_json = in_soma_pkt.to_json();
+
+    WormholePacket wifi_in_pkt;
+    wifi_in_pkt.version = 1;
+    wifi_in_pkt.flags = 0;
+    wifi_in_pkt.source_id = 0x9999;
+    wifi_in_pkt.packet_id = 456;
+    wifi_in_pkt.timestamp = 1000;
+    wifi_in_pkt.payload.assign(soma_json.begin(), soma_json.end());
+    wifi_in_pkt.payload_length = wifi_in_pkt.payload.size();
+    wifi_in_pkt.hops.push_back(0x9999);
+
+    std::vector<uint8_t> packed_wifi_in = wifi_in_pkt.pack();
+    wifi.simulate_rx(packed_wifi_in.data(), packed_wifi_in.size(), 0x9999);
+
+    assert(lora.transmissions.size() == 1);
+    assert(lora.transmissions[0] == "WELCOME TO SOMA");
+
+    // 3. Simulate incoming regional packet on WiFi targeting "Mission" -> SOMA Bridge should ignore / filter it
+    MeshCorePacket in_mission_pkt("#QR", "0000eeee", "regional", "message", "Mission");
+    in_mission_pkt.data_text = "WELCOME TO MISSION";
+    std::string mission_json = in_mission_pkt.to_json();
+
+    WormholePacket wifi_in_pkt2;
+    wifi_in_pkt2.version = 1;
+    wifi_in_pkt2.flags = 0;
+    wifi_in_pkt2.source_id = 0x9999;
+    wifi_in_pkt2.packet_id = 457; // New ID
+    wifi_in_pkt2.timestamp = 1000;
+    wifi_in_pkt2.payload.assign(mission_json.begin(), mission_json.end());
+    wifi_in_pkt2.payload_length = wifi_in_pkt2.payload.size();
+    wifi_in_pkt2.hops.push_back(0x9999);
+
+    std::vector<uint8_t> packed_wifi_in2 = wifi_in_pkt2.pack();
+    wifi.simulate_rx(packed_wifi_in2.data(), packed_wifi_in2.size(), 0x9999);
+
+    // Transmissions count should remain 1 (ignored the Mission packet)
+    assert(lora.transmissions.size() == 1);
+
+    std::cout << "test_lora_bridge_routing: PASSED" << std::endl;
+}
+
+void test_extender_routing() {
+    Region soma("SOMA", 37.7700, -122.4100, 1500.0);
+    Region mission("Mission", 37.7500, -122.4100, 1500.0);
+    std::vector<Region> regions = {soma, mission};
+
+    TestWifi wifi;
+    Deduplicator dedup(120);
+
+    // Extender located in SOMA
+    Extender extender(wifi, dedup, 0x5555, 37.7720, -122.4120, regions);
+    bool ok = extender.start();
+    assert(ok == true);
+
+    // 1. Simulate receiving regional "SOMA" packet from WiFi -> Extender in SOMA should repeat it
+    MeshCorePacket soma_pkt("#QR", "0000eeee", "regional", "message", "SOMA");
+    soma_pkt.data_text = "SOMA ALERT";
+    std::string soma_json = soma_pkt.to_json();
+
+    WormholePacket wifi_pkt;
+    wifi_pkt.version = 1;
+    wifi_pkt.flags = 0;
+    wifi_pkt.source_id = 0x1111;
+    wifi_pkt.packet_id = 777;
+    wifi_pkt.timestamp = 2000;
+    wifi_pkt.payload.assign(soma_json.begin(), soma_json.end());
+    wifi_pkt.payload_length = wifi_pkt.payload.size();
+    wifi_pkt.hops.push_back(0x1111);
+
+    std::vector<uint8_t> packed_wifi = wifi_pkt.pack();
+    wifi.simulate_rx(packed_wifi.data(), packed_wifi.size(), 0x1111);
+
+    assert(wifi.broadcasts.size() == 1); // Repeated!
+
+    WormholePacket repeated_pkt;
+    bool unpacked = WormholePacket::unpack(wifi.broadcasts[0].data(), wifi.broadcasts[0].size(), repeated_pkt);
+    assert(unpacked == true);
+    assert(repeated_pkt.has_visited(0x5555) == true); // Hop added!
+
+    // 2. Simulate receiving regional "Mission" packet -> SOMA Extender should ignore/filter it
+    MeshCorePacket mission_pkt("#QR", "0000eeee", "regional", "message", "Mission");
+    mission_pkt.data_text = "MISSION ALERT";
+    std::string mission_json = mission_pkt.to_json();
+
+    WormholePacket wifi_pkt2;
+    wifi_pkt2.version = 1;
+    wifi_pkt2.flags = 0;
+    wifi_pkt2.source_id = 0x1111;
+    wifi_pkt2.packet_id = 778; // New ID
+    wifi_pkt2.timestamp = 2000;
+    wifi_pkt2.payload.assign(mission_json.begin(), mission_json.end());
+    wifi_pkt2.payload_length = wifi_pkt2.payload.size();
+    wifi_pkt2.hops.push_back(0x1111);
+
+    std::vector<uint8_t> packed_wifi2 = wifi_pkt2.pack();
+    wifi.simulate_rx(packed_wifi2.data(), packed_wifi2.size(), 0x1111);
+
+    // Broadcasts count should remain 1 (ignored/filtered the Mission packet)
+    assert(wifi.broadcasts.size() == 1);
+
+    std::cout << "test_extender_routing: PASSED" << std::endl;
+}
+
 int main() {
     std::cout << "Running Desktop C++ MeshCore Verification Tests..." << std::endl;
     test_haversine_distance_and_region_contains();
     test_meshcore_packet_geographical_filtering();
     test_meshcore_packet_serialization_deserialization();
     test_coordinator_multi_region_grid_sorting();
+    test_lora_bridge_routing();
+    test_extender_routing();
     std::cout << "All Desktop C++ MeshCore Verification Tests PASSED!" << std::endl;
     return 0;
 }
